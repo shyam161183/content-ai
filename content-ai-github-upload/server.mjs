@@ -10,6 +10,7 @@ const dataRoot = env.VERCEL ? "/tmp/southtown-content-agent" : path.join(root, "
 const draftsPath = path.join(dataRoot, "drafts.json");
 const historyPath = path.join(dataRoot, "publish-history.json");
 const generatedImagesPath = path.join(dataRoot, "generated-images");
+const googleTokensKey = "google_search_console_tokens";
 
 async function loadEnv(file) {
   const out = {};
@@ -35,6 +36,133 @@ function parseCookies(req) {
     const [key, ...value] = item.trim().split("=");
     return [key, decodeURIComponent(value.join("="))];
   }));
+}
+
+function supabaseConfigured() {
+  return Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function supabaseHeaders(extra = {}) {
+  return {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    ...extra
+  };
+}
+
+function supabaseRestUrl(pathname) {
+  return `${String(env.SUPABASE_URL || "").replace(/\/+$/, "")}/rest/v1/${pathname}`;
+}
+
+async function getSetting(key) {
+  if (!supabaseConfigured()) return null;
+
+  const response = await fetch(supabaseRestUrl(`content_ai_settings?key=eq.${encodeURIComponent(key)}&select=value`), {
+    headers: supabaseHeaders()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase setting lookup failed: ${response.status}`);
+  }
+
+  const rows = await response.json().catch(() => []);
+  return rows[0]?.value || null;
+}
+
+async function saveSetting(key, value) {
+  if (!supabaseConfigured()) return null;
+
+  const response = await fetch(supabaseRestUrl("content_ai_settings?on_conflict=key"), {
+    method: "POST",
+    headers: supabaseHeaders({ Prefer: "resolution=merge-duplicates,return=representation" }),
+    body: JSON.stringify({
+      key,
+      value,
+      updated_at: new Date().toISOString()
+    })
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Supabase setting save failed: ${response.status} ${detail}`);
+  }
+
+  return response.json().catch(() => null);
+}
+
+function cookieGoogleTokens(req) {
+  const encoded = parseCookies(req).google_tokens;
+  if (!encoded) return null;
+
+  try {
+    return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function storedGoogleTokens(req) {
+  return cookieGoogleTokens(req) || await getSetting(googleTokensKey);
+}
+
+async function hasGoogleTokens(req) {
+  return Boolean(await storedGoogleTokens(req).catch(() => null));
+}
+
+async function saveGoogleTokens(tokens) {
+  if (!supabaseConfigured()) {
+    throw new Error("Supabase is not configured. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.");
+  }
+
+  const existing = await getSetting(googleTokensKey).catch(() => null);
+  const merged = {
+    ...(existing || {}),
+    ...(tokens || {})
+  };
+
+  if (!merged.refresh_token && existing?.refresh_token) {
+    merged.refresh_token = existing.refresh_token;
+  }
+
+  await saveSetting(googleTokensKey, merged);
+  return merged;
+}
+
+async function connectorStatus(req) {
+  const cookieTokens = cookieGoogleTokens(req);
+  const status = {
+    gsc: {
+      cookieConnected: Boolean(cookieTokens),
+      sharedConnected: false,
+      supabaseConfigured: supabaseConfigured(),
+      status: "Not connected",
+      error: ""
+    },
+    wix: {
+      configured: Boolean(env.WIX_API_KEY && env.WIX_SITE_ID && env.WIX_MEMBER_ID),
+      needs: ["WIX_API_KEY", "WIX_SITE_ID", "WIX_MEMBER_ID"].filter((key) => !env[key])
+    },
+    facebook: {
+      configured: Boolean(env.FACEBOOK_PAGE_ID && env.FACEBOOK_PAGE_ACCESS_TOKEN),
+      needs: ["FACEBOOK_PAGE_ID", "FACEBOOK_PAGE_ACCESS_TOKEN"].filter((key) => !env[key])
+    }
+  };
+
+  try {
+    const sharedTokens = await getSetting(googleTokensKey);
+    status.gsc.sharedConnected = Boolean(sharedTokens?.refresh_token || sharedTokens?.access_token);
+    status.gsc.status = status.gsc.sharedConnected
+      ? "Shared workspace connection is saved"
+      : status.gsc.cookieConnected
+        ? "Connected only in this browser"
+        : "Not connected";
+  } catch (error) {
+    status.gsc.status = status.gsc.cookieConnected ? "Connected only in this browser" : "Not connected";
+    status.gsc.error = error.message;
+  }
+
+  return status;
 }
 
 let googleApi;
@@ -1105,7 +1233,7 @@ async function publishToWix(draft) {
 export async function handler(req, res) {
   const url = new URL(req.url, `http://localhost:${port}`);
   try {
-    if (url.pathname === "/") return send(res, 200, html(Boolean(parseCookies(req).google_tokens)), { "Content-Type": "text/html; charset=utf-8" });
+    if (url.pathname === "/") return send(res, 200, html(await hasGoogleTokens(req)), { "Content-Type": "text/html; charset=utf-8" });
     if (url.pathname.startsWith("/generated-images/")) {
       const filename = path.basename(decodeURIComponent(url.pathname));
       const filePath = path.join(generatedImagesPath, filename);
@@ -1119,14 +1247,21 @@ export async function handler(req, res) {
     }
     if (url.pathname === "/api/auth/google/callback") {
       const { tokens } = await (await oauthClient()).getToken(url.searchParams.get("code"));
-      res.writeHead(302, { Location: "/", "Set-Cookie": `google_tokens=${Buffer.from(JSON.stringify(tokens)).toString("base64url")}; HttpOnly; Path=/; SameSite=Lax` }); return res.end();
+      let savedTokens = tokens;
+      let location = "/";
+      try {
+        savedTokens = await saveGoogleTokens(tokens);
+      } catch (error) {
+        location = `/?gscStorage=browser-only&reason=${encodeURIComponent(error.message)}`;
+      }
+      res.writeHead(302, { Location: location, "Set-Cookie": `google_tokens=${Buffer.from(JSON.stringify(savedTokens)).toString("base64url")}; HttpOnly; Path=/; SameSite=Lax` }); return res.end();
     }
     if (url.pathname === "/api/gsc/opportunities") {
-      const tokens = parseCookies(req).google_tokens;
+      const tokens = await storedGoogleTokens(req);
       if (!tokens) return json(res, 401, { error: "Connect Google first." });
       const google = await getGoogle();
       const client = await oauthClient();
-      client.setCredentials(JSON.parse(Buffer.from(tokens, "base64url").toString("utf8")));
+      client.setCredentials(tokens);
       const sc = google.searchconsole({ version: "v1", auth: client });
       const startDate = url.searchParams.get("startDate");
       const endDate = url.searchParams.get("endDate");
@@ -1143,7 +1278,7 @@ export async function handler(req, res) {
     if (url.pathname === "/api/drafts" && req.method === "POST") return json(res, 200, { draft: await saveDraft(JSON.parse(await readBody(req))) });
     if (url.pathname === "/api/drafts/generate") return json(res, 200, { draft: await generateDraft(JSON.parse(await readBody(req)).opportunity) });
     if (url.pathname === "/api/drafts/generate-image" && req.method === "POST") return json(res, 200, await generateHeroImage(JSON.parse(await readBody(req))));
-    if (url.pathname === "/api/connectors/status") return json(res, 200, { wix: { configured: false, needs: ["WIX_API_KEY", "WIX_SITE_ID"] }, facebook: { configured: false, needs: ["FACEBOOK_PAGE_ID", "FACEBOOK_PAGE_ACCESS_TOKEN"] } });
+    if (url.pathname === "/api/connectors/status") return json(res, 200, await connectorStatus(req));
     if (url.pathname === "/api/drafts/export" && req.method === "POST") {
       const draft = JSON.parse(await readBody(req));
       return send(res, 200, draftMarkdown(draft), {
