@@ -1,3 +1,4 @@
+// deployment marker: shared-gsc-v3
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
